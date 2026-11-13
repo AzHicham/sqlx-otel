@@ -1,11 +1,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::BoxFuture;
+
 use opentelemetry_semantic_conventions::metric as semconv_metric;
 
 use crate::annotations::{Annotated, QueryAnnotations};
 use crate::attributes::{ConnectionAttributes, QueryTextMode};
-use crate::connection::PoolConnection;
+use crate::connection::{AcquiredConnection, PoolConnection};
 use crate::database::Database;
 use crate::metrics::Metrics;
 use crate::transaction::Transaction;
@@ -380,6 +382,21 @@ impl<DB: Database> Pool<DB> {
     /// `PoolTimedOut` when the configured acquire timeout elapses, or `PoolClosed` after
     /// [`close`](Self::close).
     pub async fn acquire(&self) -> Result<PoolConnection<DB>, sqlx::Error> {
+        let (inner, attrs) = self.acquire_measured().await?;
+        Ok(PoolConnection {
+            inner,
+            state: self.state.clone(),
+            use_time: self.use_time.clone(),
+            acquired_at: std::time::Instant::now(),
+            base_attrs: attrs,
+        })
+    }
+
+    /// Acquire a raw connection, recording the wait, pending requests and timeouts. Returns the
+    /// base attributes the caller records the use time with.
+    async fn acquire_measured(
+        &self,
+    ) -> Result<(sqlx::pool::PoolConnection<DB>, Vec<opentelemetry::KeyValue>), sqlx::Error> {
         let attrs = self.state.attrs.base_key_values();
         self.pending_requests.add(1, &attrs);
         let start = std::time::Instant::now();
@@ -391,13 +408,7 @@ impl<DB: Database> Pool<DB> {
             self.timeouts.add(1, &attrs);
         }
 
-        result.map(|inner| PoolConnection {
-            inner,
-            state: self.state.clone(),
-            use_time: self.use_time.clone(),
-            acquired_at: std::time::Instant::now(),
-            base_attrs: attrs,
-        })
+        result.map(|inner| (inner, attrs))
     }
 
     /// Begin a new transaction instrumented for OpenTelemetry.
@@ -417,6 +428,18 @@ impl<DB: Database> Pool<DB> {
             inner,
             state: self.state.clone(),
         })
+    }
+
+    /// The wrapped `sqlx::Pool`, for `SQLx` APIs that accept nothing else, such as
+    /// `sqlx::postgres::PgListener::connect_with`.
+    ///
+    /// Work done through the returned pool is **not** instrumented: no spans, no
+    /// `db.client.operation.duration`, no `db.client.connection.wait_time` / `use_time` /
+    /// `pending_requests` / `timeouts`. Its connections are the ones this pool shares, so they
+    /// still count towards `db.client.connection.count`.
+    #[must_use]
+    pub fn inner(&self) -> &sqlx::Pool<DB> {
+        &self.inner
     }
 
     /// Shut down the pool, waiting for all connections to be released.
@@ -482,5 +505,38 @@ impl<DB: Database> Pool<DB> {
                 .operation(operation)
                 .collection(collection),
         )
+    }
+}
+
+/// Lets `SQLx` APIs generic over [`sqlx::Acquire`] – `sqlx::migrate::Migrator::run` among them –
+/// take an instrumented pool.
+///
+/// Both methods record `db.client.connection.wait_time`, `pending_requests` and `timeouts` like
+/// [`Pool::acquire`]. `acquire` returns an [`AcquiredConnection`], which records
+/// `db.client.connection.use_time` when dropped. `begin` returns a plain `sqlx::Transaction`,
+/// which does not report when it releases its connection, so that lease records no `use_time`.
+/// Queries run through either are not instrumented.
+impl<'a, DB: Database> sqlx::Acquire<'a> for &'a Pool<DB> {
+    type Database = DB;
+
+    type Connection = AcquiredConnection<DB>;
+
+    fn acquire(self) -> BoxFuture<'a, Result<Self::Connection, sqlx::Error>> {
+        Box::pin(async move {
+            let (inner, attrs) = self.acquire_measured().await?;
+            Ok(AcquiredConnection {
+                inner,
+                use_time: self.use_time.clone(),
+                acquired_at: std::time::Instant::now(),
+                base_attrs: attrs,
+            })
+        })
+    }
+
+    fn begin(self) -> BoxFuture<'a, Result<sqlx::Transaction<'a, DB>, sqlx::Error>> {
+        Box::pin(async move {
+            let (inner, _) = self.acquire_measured().await?;
+            sqlx::Transaction::begin(inner, None).await
+        })
     }
 }

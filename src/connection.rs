@@ -1,3 +1,4 @@
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -54,4 +55,50 @@ impl<DB: sqlx::Database> std::fmt::Debug for PoolConnection<DB> {
 
 impl<DB: Database> PoolConnection<DB> {
     impl_with_annotations_mut!();
+}
+
+/// A pooled connection acquired through the [`sqlx::Acquire`] implementation on `&Pool`.
+///
+/// It exists so that `SQLx` APIs generic over [`sqlx::Acquire`] – such as
+/// `sqlx::migrate::Migrator::run` – accept an instrumented [`Pool`](crate::Pool). It dereferences
+/// to the backend connection, the type those APIs expect.
+///
+/// The acquisition is instrumented exactly like [`Pool::acquire`](crate::Pool::acquire)
+/// (`db.client.connection.wait_time`, `pending_requests`, `timeouts`), and
+/// `db.client.connection.use_time` is recorded when the value is dropped. Queries run on the
+/// dereferenced connection are **not** instrumented: no spans, no
+/// `db.client.operation.duration`. Use [`Pool::acquire`](crate::Pool::acquire) to run
+/// instrumented queries on a dedicated connection.
+pub struct AcquiredConnection<DB: sqlx::Database> {
+    pub(crate) inner: sqlx::pool::PoolConnection<DB>,
+    pub(crate) use_time: Arc<Histogram<f64>>,
+    pub(crate) acquired_at: Instant,
+    pub(crate) base_attrs: Vec<KeyValue>,
+}
+
+impl<DB: sqlx::Database> Drop for AcquiredConnection<DB> {
+    fn drop(&mut self) {
+        self.use_time
+            .record(self.acquired_at.elapsed().as_secs_f64(), &self.base_attrs);
+    }
+}
+
+impl<DB: sqlx::Database> std::fmt::Debug for AcquiredConnection<DB> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcquiredConnection").finish_non_exhaustive()
+    }
+}
+
+impl<DB: sqlx::Database> Deref for AcquiredConnection<DB> {
+    type Target = DB::Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl<DB: sqlx::Database> DerefMut for AcquiredConnection<DB> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
 }
